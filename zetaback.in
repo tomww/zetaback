@@ -770,6 +770,7 @@ sub zfs_do_backup($$$$$$;$) {
   my $ssh_config = config_get($host, 'ssh_config');
   $ssh_config = "-F $ssh_config" if($ssh_config);
   print "Using custom ssh config file: $ssh_config\n" if($DEBUG);
+  print "INFO for debug: host: $host, fs: $fs, type: $type, point: $point, store: $store, dumpname: $dumpname, base: $base\n";
 
   # compression is meaningless for dataset backups
   if ($type ne "s") {
@@ -795,10 +796,16 @@ sub zfs_do_backup($$$$$$;$) {
       $storefs="$storefs/$host";
     }
     $encodedname = fs_encode($dumpname);
+    print "INFO for debug: storefs: $storefs,  encodedname: $encodedname\n";
+    my $encodedfs = $encodedname;
+       $encodedfs =~ s/@.*//;
+    print "INFO3+ suggested zfs rollback command: zfs rollback ".$storefs."/".$encodedfs."\@$base\n";
+    print "Rolling back to ".$storefs."/".$encodedfs."\@$base\n";
+    `/usr/sbin/zfs rollback $storefs."/".$encodedfs."\@$base`; # We don't care if this fails
     print STDERR "Receiving to zfs filesystem $storefs/$encodedname\n"
       if($DEBUG);
     zfs_create_intermediate_filesystems("$storefs/$encodedname");
-    open(LBACKUP, "|__ZFS__ recv $storefs/$encodedname");
+    open(LBACKUP, "|__ZFS__ recv $storefs/$encodedname") or print "Receive failed. Command was: \"|__ZFS__ recv $storefs/$encodedname\"\n";
   }
   # Do it. yeah.
   eval {
@@ -1630,10 +1637,11 @@ sub plan_and_run($$) {
       # We need to drop a __zb_base snap or a __zb_incr snap before we proceed
       unless($NEUTERED || $backup_type eq 'no') {
         # attempt to lock this action, if it fails, skip -- someone else is working it.
-        next unless(lock($host, dir_encode($diskname), 1));
+        next unless(lock($host, dir_encode($diskname . ".lock"), 1));
         unlock($host, '.list');
 
         if($backup_type eq 'full') {
+          print "DEBUG: zfs_full_backup($host, $diskname, $store)\n";
           eval { zfs_full_backup($host, $diskname, $store); };
           if ($@) {
             chomp(my $err = $@);
@@ -1642,6 +1650,7 @@ sub plan_and_run($$) {
           else {
             # Unless there was an error backing up, remove all the other full snaps
             foreach (keys %snaps) {
+              print "DEBUG: zfs_remove_snap($host, $diskname, $_)\n" if(/^__zb_full_(\d+)/);
               zfs_remove_snap($host, $diskname, $_) if(/^__zb_full_(\d+)/) 
             }
           }
@@ -1664,6 +1673,7 @@ sub plan_and_run($$) {
         }
         if($backup_type eq 'dataset') {
           my @backups = sort { $b <=> $a } (keys %{$backup_info->{'full'}});
+          print "DEBUG: zfs_dataset_backup($host, $diskname, $backups[0], $store)\n";
           eval { zfs_dataset_backup($host, $diskname, $backups[0], $store); };
           if ($@) {
             chomp(my $err = $@);
@@ -1672,16 +1682,19 @@ sub plan_and_run($$) {
           else {
             # Unless there was an error backing up, remove all the other dset snaps
             foreach (keys %snaps) {
+              print "DEBUG: zfs_remove_snap($host, $diskname, $_)\n" if(/^__zb_dset_(\d+)/);
               zfs_remove_snap($host, $diskname, $_) if(/^__zb_dset_(\d+)/) 
             }
           }
           $took_action = 1;
         }
-        unlock($host, dir_encode($diskname), 1);
+        print "DEBUG: unlock ($host, dir_encode($diskname . \".lock\")\n";
+        unlock($host, dir_encode($diskname . ".lock"), 1);
       }
       $suppress{"$host:$diskname"} = 1;
       last if($took_action);
     }
+    print "DEBUG: unlock($host, '.list')\n";
     unlock($host, '.list');
   }
 }
