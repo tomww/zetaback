@@ -21,11 +21,15 @@ use vars qw/%conf %locks $version_string $process_lock
             $LIST $SUMMARY $SUMMARY_EXT $SUMMARY_VIOLATORS
             $SUMMARY_VIOLATORS_VERBOSE $FORCE_FULL $FORCE_INC
             $EXPUNGE $NEUTERED $ZFS $SHOW_FILENAMES $ARCHIVE
-            $VERSION $HELP/;
+            $VERSION $HELP $SYSCONFDIR $PV_BIN/;
 $version_string = '1.0.6';
 $PREFIX = q^__PREFIX__^;
-$CONF = qq^$PREFIX/etc/zetaback.conf^;
+$SYSCONFDIR = q^/etc/zetaback^;
+$CONF = qq^$SYSCONFDIR/zetaback.conf^;
 $BLOCKSIZE = 1024*64;
+$PV_BIN = "/usr/bin/pv";
+#smartos
+$PV_BIN = "/opt/bin/pv" unless -x $PV_BIN;
 
 $conf{'default'}->{'time_format'} = "%Y-%m-%d %H:%M:%S";
 $conf{'default'}->{'retention'} = 14 * 86400;
@@ -763,14 +767,23 @@ sub zfs_remove_snap($$$) {
 }
 
 # Lots of args.. internally called.
+# #
+#   my ($host, $fs, $base, $store) = @_;
+#     my $agent = config_get($host, 'agent');
+#
+#       my $point = time();
+#         my $dumpname = "$fs\@$point";
+#
+#           zfs_do_backup($host, $fs, 's', $point, $store, $dumpname, $base);
+#
 sub zfs_do_backup($$$$$$;$) {
   my ($host, $fs, $type, $point, $store, $dumpname, $base) = @_;
   my ($storefs, $encodedname);
+  my ($encoded_fs_name, $rollback_to_snapshot);
   my $agent = config_get($host, 'agent');
   my $ssh_config = config_get($host, 'ssh_config');
   $ssh_config = "-F $ssh_config" if($ssh_config);
   print "Using custom ssh config file: $ssh_config\n" if($DEBUG);
-  print "INFO for debug: host: $host, fs: $fs, type: $type, point: $point, store: $store, dumpname: $dumpname, base: $base\n";
 
   # compression is meaningless for dataset backups
   if ($type ne "s") {
@@ -796,16 +809,16 @@ sub zfs_do_backup($$$$$$;$) {
       $storefs="$storefs/$host";
     }
     $encodedname = fs_encode($dumpname);
-    print "INFO for debug: storefs: $storefs,  encodedname: $encodedname\n";
-    my $encodedfs = $encodedname;
-       $encodedfs =~ s/@.*//;
-    print "INFO3+ suggested zfs rollback command: zfs rollback ".$storefs."/".$encodedfs."\@$base\n";
-    print "Rolling back to ".$storefs."/".$encodedfs."\@$base\n";
-    `/usr/sbin/zfs rollback $storefs."/".$encodedfs."\@$base`; # We don't care if this fails
-    print STDERR "Receiving to zfs filesystem $storefs/$encodedname\n"
-      if($DEBUG);
+    print STDERR "Receiving to zfs filesystem $storefs/$encodedname\n" if($DEBUG);
     zfs_create_intermediate_filesystems("$storefs/$encodedname");
-    open(LBACKUP, "|__ZFS__ recv $storefs/$encodedname") or print "Receive failed. Command was: \"|__ZFS__ recv $storefs/$encodedname\"\n";
+    $rollback_to_snapshot = fs_encode($fs."\@".$base); 
+    print "__ZFS__ rollback -r $storefs/$rollback_to_snapshot\n";
+          `__ZFS__ rollback -r $storefs/$rollback_to_snapshot`;
+    print "DEBUG open(LBACKUP, __ZFS__ recv -F $storefs/$encodedname\n";
+    $encoded_fs_name = fs_encode($fs);   #"$fs\@$point";
+
+    print "DEBUG open(LBACKUP, __ZFS__ recv -v -F $storefs/$encoded_fs_name\n";
+    open(LBACKUP, "|".$PV_BIN." -q -B250m |__ZFS__ recv -v -F $storefs/$encoded_fs_name") or print "Receive failed. Command was: \"|__ZFS__ recv -v -F $storefs/$encoded_fs_name\"\n";
   }
   # Do it. yeah.
   eval {
@@ -835,9 +848,16 @@ sub zfs_do_backup($$$$$$;$) {
       rename("$store/.$dumpname", "$store/$dumpname") || die "cannot rename dump\n";
     } else {
       # Check everything is ok
+      # __zb_dset_
+      print "rename received snapshot (only the last one, not the intermediates if there are any)"
+          . "__ZFS__ rename $storefs/$encoded_fs_name\@__zb_dset_$point $storefs/$encodedname<\n";
+            `__ZFS__ rename $storefs/$encoded_fs_name\@__zb_dset_$point $storefs/$encodedname`;
       `__ZFS__ list $storefs/$encodedname`;
-      die "dump failed (received snapshot $storefs/$encodedname does not exist)\n"
-        if $?;
+      if ($?) {
+	      `__ZFS__ rename $storefs/$rollback_to_snapshot $storefs/${rollback_to_snapshot}_probably_unusable_snapshot`;
+	      die "dump failed (received snapshot $storefs/$encodedname does not exist)\nNOW removing latest local snapshot with __ZFS__ destroy $storefs/${rollback_to_snapshot}_probably_unusable_snapshot\n";
+	      `__ZFS__ destroy $storefs/${rollback_to_snapshot}_probably_unusable_snapshot`;
+	      }
     }
   };
   if($@) {
@@ -1262,7 +1282,7 @@ sub perform_restore() {
     my $tf = config_get($host, 'time_format');
     map { $times{$_} = strftime($tf, localtime($_)); } @{$source{$host}->{$disk}};
     my $timestamp = choose("Restore as of timestamp", \%times, 0,
-                            sub { $_[0] <=> $_[1]; });
+        sub { $_[0] <=> $_[1]; });
 
     my $store = get_store($host, $classmap{$host}->{$disk});
     my $backup_info = scan_for_backups($store);
@@ -1279,7 +1299,7 @@ sub perform_restore() {
       $RESTORE_ZFS = length($input) ? $input : $disk;
     }
 
-    # show intentions
+# show intentions
     print "Going to restore:\n";
     print "\tfrom: $host\n";
     print "\tfrom: $disk\n";
@@ -1311,20 +1331,20 @@ sub zfs_restore_part($$$$;$) {
     $command .= " -b $dep" if($dep);
   }
   else {
-    $command = "__ZFS__ recv $fs";
+    $command = $PV_BIN." -q -B250m | __ZFS__ recv $fs";
   }
   if ($file) {
     print " => piping $file to $command\n" if($DEBUG);
     print "gzip -dfc $file | ssh $ssh_config $host $command\n" if ($DEBUG && $NEUTERED);
   } elsif ($dataset) {
     print " => piping $dataset to $command using zfs send\n" if ($DEBUG);
-    print "zfs send $dataset | ssh $ssh_config $host $command\n" if ($DEBUG && $NEUTERED);
+    print "zfs send $dataset | ".$PV_BIN." -q -B250m | ssh $ssh_config $host $command\n" if ($DEBUG && $NEUTERED);
   }
   unless($NEUTERED) {
     if ($file) {
       open(DUMP, "gzip -dfc $file |");
     } elsif ($dataset) {
-      open(DUMP, "__ZFS__ send $dataset |");
+      open(DUMP, "__ZFS__ send $dataset |".$PV_BIN." -q -B250m |");
     }
     eval {
       open(RECEIVER, "| ssh $ssh_config $host $command");
@@ -1382,14 +1402,14 @@ sub show_backups($$) {
       next unless(ref($info) eq 'HASH');
       next
         if($diskpat &&      # if the pattern was specified it could
-          !($disk eq $diskpat ||        # be a specific match or a
-            ($diskpat =~ /^\/(.+)\/$/ && $disk =~ /$1/))); # regex
+            !($disk eq $diskpat ||        # be a specific match or a
+              ($diskpat =~ /^\/(.+)\/$/ && $disk =~ /$1/))); # regex
 
-      my @backup_points = (keys %{$info->{full}}, keys %{$info->{incremental}});
+          my @backup_points = (keys %{$info->{full}}, keys %{$info->{incremental}});
       @backup_points = sort { $a <=> $b } @backup_points;
       @backup_points = (pop @backup_points) unless ($ARCHIVE || $SUMMARY_EXT);
 
-      # We want to see this one
+# We want to see this one
       print "$host:$disk\n";
       next unless($SUMMARY || $SUMMARY_EXT || $ARCHIVE);
       if($SUMMARY_EXT) {
@@ -1488,42 +1508,42 @@ sub show_violators($$) {
       my $info = $backup_info->{$disk};
       next unless(ref($info) eq 'HASH');
       next if (
-        $diskpat &&      # if the pattern was specified it could
-        !(
-          $disk eq $diskpat ||                        # be a specific match
-          ($diskpat =~ /^\/(.+)\/$/ && $disk =~ /$1/) # or a regex
-        )
-      ); # regex
-      # Backups for filesystems that no longer exist aren't violators
-      if (!$SUMMARY_VIOLATORS_VERBOSE && %{$filesystems} &&
-        !defined $filesystems->{$disk}) {
-        print "=> $disk doesn't exist on server, not marking as violator\n"
-          if ($DEBUG);
-        next;
-      }
+          $diskpat &&      # if the pattern was specified it could
+          !(
+            $disk eq $diskpat ||                        # be a specific match
+            ($diskpat =~ /^\/(.+)\/$/ && $disk =~ /$1/) # or a regex
+           )
+          ); # regex
+# Backups for filesystems that no longer exist aren't violators
+        if (!$SUMMARY_VIOLATORS_VERBOSE && %{$filesystems} &&
+            !defined $filesystems->{$disk}) {
+          print "=> $disk doesn't exist on server, not marking as violator\n"
+            if ($DEBUG);
+          next;
+        }
 
 
       my @violators = ();
 
-      # No recent full
+# No recent full
       if (time() > $info->{last_full} +
           config_get($host, 'full_interval', $class) +
           config_get($host, 'violator_grace_period', $class)) {
         push @violators, {
           "host" => $host, "disk" => $disk,
-          "reason" => "No recent full backup",
-          "backup" => "full"
+            "reason" => "No recent full backup",
+            "backup" => "full"
         }
       }
 
-      # No recent incremental
+# No recent incremental
       if (time() > $info->{last_backup} +
           config_get($host, 'backup_interval', $class) +
           config_get($host, 'violator_grace_period', $class)) {
         push @violators, {
           "host" => $host, "disk" => $disk,
-          "reason" => "No recent incremental backup",
-          "backup" => "backup"
+            "reason" => "No recent incremental backup",
+            "backup" => "backup"
         }
       }
 
@@ -1548,10 +1568,10 @@ sub plan_and_run($$) {
     $took_action = 0;
     my @disklist;
 
-    # We need a lock for the listing.
+# We need a lock for the listing.
     return unless(lock($host, ".list"));
 
-    # Get list of zfs filesystems from the agent
+# Get list of zfs filesystems from the agent
     open(SILENT, ">&", \*STDERR);
     close(STDERR);
     my $rv = open(ZFSLIST, "ssh $ssh_config $host $agent -l |");
@@ -1560,14 +1580,15 @@ sub plan_and_run($$) {
     next unless $rv;
     @disklist = grep { chomp } (<ZFSLIST>);
     close(ZFSLIST);
-    # Write the filesystem list out to a file for use by the violators list
+# Write the filesystem list out to a file for use by the violators list
     my $store = get_store($host); # Don't take classes into account - not needed
-    mkpath($store) if(! -d $store);
+      mkpath($store) if(! -d $store);
     open(my $fh, ">$store/.fslist");
     foreach my $diskline (@disklist) {
-      # Get only the filesystem and not the snapshots/classes
+# Get only the filesystem and not the snapshots/classes
       (my $filesystem = $diskline) =~ s/ \[.*//;
       print $fh "$filesystem\n";
+      print "    $diskline\n" if ($DEBUG);
     }
     close($fh);
     if ($DEBUG) {
@@ -1579,78 +1600,79 @@ sub plan_and_run($$) {
 
     foreach my $diskline (@disklist) {
       chomp($diskline);
-      next unless($diskline =~ /^(\S+) \[([^\]]*)\](?: {([^}]*)})?/);
-      my $diskname = $1;
-      my %snaps;
-      map { $snaps{$_} = 1 } (split(/,/, $2));
-      my $class = $3;
- 
-      # We've just done this.
-      next if($suppress{"$host:$diskname"}); 
-      # If we are being selective (via -z) now is the time.
-      next
-        if($diskpat &&          # if the pattern was specified it could
-           !($diskname eq $diskpat ||        # be a specific match or a
-             ($diskpat =~ /^\/(.+)\/$/ && $diskname =~ /$1/))); # regex
-  
+      next unless($diskline =~ /^(\S+) \[([^\]]*)\](?: \{([^}]*)\})?/);
+  my $diskname = $1;
+  my %snaps;
+  map { $snaps{$_} = 1 } (split(/,/, $2));
+  my $class = $3;
+
+# We've just done this.
+  next if($suppress{"$host:$diskname"}); 
+# If we are being selective (via -z) now is the time.
+  next
+    if($diskpat &&          # if the pattern was specified it could
+        !($diskname eq $diskpat ||        # be a specific match or a
+          ($diskpat =~ /^\/(.+)\/$/ && $diskname =~ /$1/))); # regex
+
       $store = get_store($host, $class);
-      if ($DEBUG) {
-        if ($class) {
-            print STDERR "=> Class is $class\n";
-        } else {
-            print STDERR "=> No/default class\n";
-        }
-      }
-      print " => Scanning '$store' for old backups of '$diskname'.\n" if($DEBUG);
+  if ($DEBUG) {
+    if ($class) {
+      print STDERR "=> Class is $class\n";
+    } else {
+      print STDERR "=> No/default class\n";
+    }
+  }
+  print " => Scanning '$store' for old backups of '$diskname'.\n" if($DEBUG);
 
-      # Make directory on demand
-      mkpath($store) if(! -d $store);
-      my $backup_info = scan_for_backups($store);
-      # That gave us info on all backups, we just want this disk
-      $backup_info = $backup_info->{$diskname} || {};
-  
-      # Should we do a backup?
-      my $backup_type = 'no';
-      if(time() > $backup_info->{last_backup} + config_get($host,
-          'backup_interval', $class)) {
-        $backup_type = 'incremental';
-      }
-      if(time() > $backup_info->{last_full} + config_get($host,
-          'full_interval', $class)) {
-        $backup_type = 'full';
-      }
-      # If we want an incremental, but have no full, then we need to upgrade to full
-      if($backup_type eq 'incremental') {
-        my $have_full_locally = 0;
-        # For each local full backup, see if the full backup still exists on the other end.
-        foreach (keys %{$backup_info->{'full'}}) {
-          $have_full_locally = 1 if(exists($snaps{'__zb_full_' . $_}));
-        }
-        $backup_type = 'full' unless($have_full_locally);
-      }
-      $backup_type = 'full' if($FORCE_FULL);
-      $backup_type = 'incremental' if($FORCE_INC);
-      $backup_type = 'dataset' if(config_get($host, 'dataset_backup', $class)
-        eq 1 && $backup_type ne 'no');
+# Make directory on demand
+  mkpath($store) if(! -d $store);
+  my $backup_info = scan_for_backups($store);
+# That gave us info on all backups, we just want this disk
+  $backup_info = $backup_info->{$diskname} || {};
 
-      print " => doing $backup_type backup\n" if($DEBUG);
-      # We need to drop a __zb_base snap or a __zb_incr snap before we proceed
-      unless($NEUTERED || $backup_type eq 'no') {
-        # attempt to lock this action, if it fails, skip -- someone else is working it.
-        next unless(lock($host, dir_encode($diskname . ".lock"), 1));
-        unlock($host, '.list');
+# Should we do a backup?
+  my $backup_type = 'no';
+  if(time() > $backup_info->{last_backup} + config_get($host,
+        'backup_interval', $class)) {
+    $backup_type = 'incremental';
+  }
+  if(time() > $backup_info->{last_full} + config_get($host,
+        'full_interval', $class)) {
+    $backup_type = 'full';
+  }
+# If we want an incremental, but have no full, then we need to upgrade to full
+  if($backup_type eq 'incremental') {
+    my $have_full_locally = 0;
+# For each local full backup, see if the full backup still exists on the other end.
+    foreach (keys %{$backup_info->{'full'}}) {
+      $have_full_locally = 1 if(exists($snaps{'__zb_full_' . $_}));
+    }
+    $backup_type = 'full' unless($have_full_locally);
+  }
+  $backup_type = 'full' if($FORCE_FULL);
+  $backup_type = 'incremental' if($FORCE_INC);
+  $backup_type = 'dataset' if(config_get($host, 'dataset_backup', $class)
+      eq 1 && $backup_type ne 'no');
 
-        if($backup_type eq 'full') {
-          print "DEBUG: zfs_full_backup($host, $diskname, $store)\n";
-          eval { zfs_full_backup($host, $diskname, $store); };
-          if ($@) {
-            chomp(my $err = $@);
-            print " => failure $err\n";
-          }
-          else {
-            # Unless there was an error backing up, remove all the other full snaps
+  print " => doing $backup_type backup\n" if($DEBUG);
+# We need to drop a __zb_base snap or a __zb_incr snap before we proceed
+  unless($NEUTERED || $backup_type eq 'no') {
+# attempt to lock this action, if it fails, skip -- someone else is working it.
+#next unless(lock($host, dir_encode($diskname), 1));
+    print "DEBUG: lock ($host, dir_encode($diskname . \".lock\")\n" if($DEBUG);
+    next unless(lock($host, dir_encode($diskname . ".lock"), 1));
+    unlock($host, '.list');
+
+    if($backup_type eq 'full') {
+      eval { zfs_full_backup($host, $diskname, $store); };
+      if ($@) {
+        chomp(my $err = $@);
+        print " => failure $err\n";
+      }
+      else {
+# Unless there was an error backing up, remove all the other full snaps
+##TODO## verify that before removing the last snap that we have exactly this last snap on our local store (e.g. snapshot <number> exists locally
             foreach (keys %snaps) {
-              print "DEBUG: zfs_remove_snap($host, $diskname, $_)\n" if(/^__zb_full_(\d+)/);
               zfs_remove_snap($host, $diskname, $_) if(/^__zb_full_(\d+)/) 
             }
           }
@@ -1673,28 +1695,96 @@ sub plan_and_run($$) {
         }
         if($backup_type eq 'dataset') {
           my @backups = sort { $b <=> $a } (keys %{$backup_info->{'full'}});
-          print "DEBUG: zfs_dataset_backup($host, $diskname, $backups[0], $store)\n";
-          eval { zfs_dataset_backup($host, $diskname, $backups[0], $store); };
+	  my $local_backup = "";
+	  #eval { zfs_dataset_backup($host, $diskname, $backups[0], $store); };
+
+##TODO## improve way the two lists are searched for the most fresh matching snapshot	  
+	  # need this, in case latest snap remotely is not matching latest snapshot locally
+	  # try finding the most recent remote snapshot that matches a snapshot locally
+	  foreach my $remotesnap (sort{$b cmp $a} keys %snaps) {
+		  print "remotely present snaps: >$remotesnap<\n";
+		  # if($snaps{'__zb_incr'}
+		  # if(/^__zb_full_(\d+)/#
+		  #next if not /^__zb_dset_\d+/;
+		  next if not ($remotesnap =~ /^__zb_dset_\d+/);
+		  my $remote_snap_number = $remotesnap;
+		     $remote_snap_number =~ s/^__zb_dset_//;
+	       foreach my $test_local_backup (@backups) {
+		  print "local backups/snapshots >$test_local_backup<\n";
+		  if ($test_local_backup =~ m/$remote_snap_number/) {
+		      $local_backup = $test_local_backup;
+	              print "found a snapshot that exists locally >$local_backup< and remotely >$remote_snap_number<\n";
+		      last;
+		  } #if $remote_snap_number
+		  #else {
+			  #	  print "not on both sides: >$test_local_backup<\n";
+			  #}
+               } #foreach @backups
+	       #we can stop searching if the content in local_backup is only digits (approximates to a zetaback snapshot)
+	       ##TODO## improve by ensuring that it _is_ a zetaback numbered snapshot and not a manual snapshot-name
+               if($local_backup =~ m/\d+/) {
+		  #found a remote backup that is present on local side
+	          print "found this snapshot for incremental backup >$local_backup<\n";
+		  last;
+	          }
+		  else {
+	          print "not usable remote_snapshot >$remotesnap<, has no local counterpart\n";
+	          }
+          }
+	  # Examples
+          #on backup this system
+	  #locally present snaps: >__zb_dset_1570034231<
+	  #locally present snaps: >__zb_dset_1569915521<
+          #on system that is to be backuped - can have more recent snapshots but the transfer has failed some time before
+	  #remotely present backups >1569915521<
+	  #remotely present backups >1569872273<
+	  #remotely present backups >1569861515<
+	  #remotely present backups >1569850767<
+	  #
+	  ##
+	  #Acquiring lock for sourcesystemname:BASE64datasetname==
+	  #Releasing lock for sourcesystemname:.list
+	  #locally present snaps: >__zb_dset_1570988601<
+	  #Using custom ssh config file:
+	  #Receiving to zfs filesystem poolname/zetaback/zfs_backups/sourcesystemname_userhomes/BASE64datasetname-@1570994803
+	  #   => ssh sourcesystemname zetaback_agent -z poolname/localhomes/username -i 1570990327 -s 1570994803
+	  #   2019-10-13 21:26:47: FAILED[dump failed (received snapshot poolname/zetaback/zfs_backups/sourcesystemname_userhomes/BASE64datasetname
+	  #   BASE64datasetname-@1570994803 does not exist)] sourcesystemname:poolname/localhomes/username s
+	  #
+	  #no match found, use the latest local snapshot as reference
+	  if ($local_backup !~ /\d+/) {
+	     $local_backup = $backups[0];
+	     print "no matching local snapshot and remote snapshot. using first local backup >$local_backup<\n";
+	     print "Info: This might be the case _if_ both sides are in sync.\n";
+          }
+	  eval { zfs_dataset_backup($host, $diskname, $local_backup, $store); };
           if ($@) {
             chomp(my $err = $@);
             print " => failure $err\n";
           }
           else {
             # Unless there was an error backing up, remove all the other dset snaps
+				##TODO## verify that before removing the last snap that we have exactly this last snap on our local store (e.g. snapshot <number> exists locally
+            #do not delete on source system the last 20 snapshots
+            ##TODO## make this a configurable how many snapshots from zetaback should be kept on source system. find a default (e.g. 10).
+            my $skipfirstsnap=20;
             foreach (keys %snaps) {
-              print "DEBUG: zfs_remove_snap($host, $diskname, $_)\n" if(/^__zb_dset_(\d+)/);
-              zfs_remove_snap($host, $diskname, $_) if(/^__zb_dset_(\d+)/) 
+              if ($skipfirstsnap >= 0) {
+                 $skipfirstsnap--;
+                 print " keep the old snaps ($host, $diskname, $_)\n";
+                 next;
+              }
+	      zfs_remove_snap($host, $diskname, $_) if(/^__zb_dset_(\d+)/) 
             }
           }
           $took_action = 1;
         }
-        print "DEBUG: unlock ($host, dir_encode($diskname . \".lock\")\n";
+        print "DEBUG: unlock ($host, dir_encode($diskname . \".lock\")\n" if($DEBUG);
         unlock($host, dir_encode($diskname . ".lock"), 1);
       }
       $suppress{"$host:$diskname"} = 1;
       last if($took_action);
     }
-    print "DEBUG: unlock($host, '.list')\n";
     unlock($host, '.list');
   }
 }
